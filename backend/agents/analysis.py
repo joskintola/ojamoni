@@ -5,14 +5,23 @@ Pulls 7 days of transactions from SQLite, sends them to Claude
 for deep reasoning, and returns a full business narrative in
 both English and Pidgin.
 """
-
+import os
 import json
 import re
 import anthropic
 from backend.database.db import get_recent_transactions
+from pathlib import Path
+from dotenv import load_dotenv
+# 1. Locate the .env file in the root directory
+base_dir = Path(__file__).resolve().parents[2]
+env_path = base_dir / ".env"
 
-client = anthropic.Anthropic()
+# 2. Load it
+load_dotenv(dotenv_path=env_path)
 
+# 3. Securely initialize the client
+api_key = os.getenv("ANTHROPIC_API_KEY")
+client = anthropic.Anthropic(api_key=api_key)
 
 def analyze_weekly_performance(trader_id: int, trader_name: str, business_type: str) -> dict:
     """

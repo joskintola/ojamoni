@@ -1,15 +1,29 @@
 import os
 import sys
 import shutil
+import anthropic
+from pathlib import Path
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, Request, File, Form, Response, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+from twilio.twiml.messaging_response import MessagingResponse
+from twilio.rest import Client
+import requests
 
+
+
+
+base_dir = Path(__file__).resolve().parent # If main.py is in /backend
+env_path = base_dir.parent / ".env"
+load_dotenv(dotenv_path=env_path)
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+api_key = os.getenv("ANTHROPIC_API_KEY")
+client = anthropic.Anthropic(api_key=api_key)
 
 from backend.database.db import (
     init_db, get_trader_by_phone, get_all_traders,
+    save_trader,  # <--- YOU NEED THIS HERE!
     save_transaction, get_recent_transactions,
     get_last_transaction_date, log_message, get_messages_log
 )
@@ -17,10 +31,9 @@ from backend.agents.ingestion import extract_financial_data, format_response_for
 from backend.agents.analysis import analyze_weekly_performance, format_weekly_report
 from backend.agents.voice import process_voice_note
 
-load_dotenv()
+
 
 app = FastAPI(title="OjaMoni API")
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -181,3 +194,113 @@ def trigger_nudge(trader_id: int):
 
     log_message(trader_id, nudge, sender="ojamoni")
     return {"nudge": nudge}
+@app.post("/webhook")
+async def whatsapp_webhook(
+    Body: str = Form(default=""),
+    From: str = Form(default=""),
+    MediaUrl0: str = Form(default=""),
+    MediaContentType0: str = Form(default=""),
+    NumMedia: str = Form(default="0"),
+):
+    """Twilio WhatsApp webhook — handles all incoming messages"""
+    
+    response = MessagingResponse()
+    phone = From  # e.g. whatsapp:+2348012345678
+    clean_phone = phone.replace("whatsapp:", "")
+
+    # Get or create trader
+    trader = get_trader_by_phone(clean_phone)
+    if not trader:
+        save_trader("Trader", clean_phone, "General")
+        trader = get_trader_by_phone(clean_phone)
+    
+    trader_id = trader["id"]
+    trader_name = trader["name"]
+
+    # Log incoming message
+    log_message(trader_id, Body or "[media]", sender="trader")
+
+    try:
+        # Handle image
+        if NumMedia != "0" and MediaUrl0 and "image" in MediaContentType0:
+            img_data = requests.get(
+                MediaUrl0,
+                auth=(
+                    os.getenv("TWILIO_ACCOUNT_SID"),
+                    os.getenv("TWILIO_AUTH_TOKEN")
+                )
+            ).content
+            img_path = os.path.join(UPLOAD_DIR, "whatsapp_image.jpg")
+            with open(img_path, "wb") as f:
+                f.write(img_data)
+            data = extract_financial_data(image_path=img_path)
+            reply = format_response_for_trader(data, trader_name)
+            save_transaction(
+                trader_id=trader_id,
+                date=datetime.now().strftime("%Y-%m-%d"),
+                revenue=data.get("revenue", 0),
+                expenses=data.get("expenses", 0),
+                profit=data.get("profit", 0),
+                raw_input="[WhatsApp Image]",
+                ai_insight=data.get("insight", "")
+            )
+
+        # Handle audio/voice note
+        elif NumMedia != "0" and MediaUrl0 and "audio" in MediaContentType0:
+            audio_data = requests.get(
+                MediaUrl0,
+                auth=(
+                    os.getenv("TWILIO_ACCOUNT_SID"),
+                    os.getenv("TWILIO_AUTH_TOKEN")
+                )
+            ).content
+            audio_path = os.path.join(UPLOAD_DIR, "whatsapp_audio.ogg")
+            with open(audio_path, "wb") as f:
+                f.write(audio_data)
+            data, reply = process_voice_note(audio_path, trader_name)
+            if data:
+                save_transaction(
+                    trader_id=trader_id,
+                    date=datetime.now().strftime("%Y-%m-%d"),
+                    revenue=data.get("revenue", 0),
+                    expenses=data.get("expenses", 0),
+                    profit=data.get("profit", 0),
+                    raw_input="[WhatsApp Voice Note]",
+                    ai_insight=data.get("insight", "")
+                )
+
+        # Handle weekly report request
+        elif "weekly report" in Body.lower():
+            analysis = analyze_weekly_performance(
+                trader_id, trader_name, trader["business_type"]
+            )
+            reply = format_weekly_report(analysis, trader_name)
+
+        # Handle text message
+        else:
+            data = extract_financial_data(text_input=Body)
+            
+            if data.get("needs_clarification"):
+                reply = data.get("clarification_prompt", "Abeg tell me your sales and expenses for today 🙏")
+            elif data.get("is_off_topic"):
+                reply = data.get("off_topic_response", "I be financial assistant o! Send me your sales record make I help you track am 📊")
+            elif data.get("is_emotional"):
+                reply = data.get("emotional_response", "E go better! Keep recording your sales — knowledge is power 💪")
+            else:
+                reply = format_response_for_trader(data, trader_name)
+                save_transaction(
+                    trader_id=trader_id,
+                    date=datetime.now().strftime("%Y-%m-%d"),
+                    revenue=data.get("revenue", 0),
+                    expenses=data.get("expenses", 0),
+                    profit=data.get("profit", 0),
+                    raw_input=Body,
+                    ai_insight=data.get("insight", "")
+                )
+
+    except Exception as e:
+        reply = f"Sorry, something went wrong. Please try again 🙏 (Error: {str(e)[:50]})"
+
+    log_message(trader_id, reply, sender="ojamoni")
+    response.message(reply)
+    return Response(content=str(response), media_type="application/xml")

@@ -1,10 +1,17 @@
+import os
 import anthropic
 import base64
 import json
 import re
 from pathlib import Path
 
-client = anthropic.Anthropic()
+from dotenv import load_dotenv
+from pathlib import Path
+
+# Load .env from project root regardless of where script is run from
+load_dotenv(dotenv_path=Path(__file__).resolve().parents[2] / ".env")
+
+client = anthropic.Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
 
 SYSTEM_PROMPT = """You are OjaMoni, a friendly AI financial assistant for Nigerian informal traders.
 Your job is to extract financial data from trader messages — which may be in English, Pidgin English, Yoruba/Igbo/Hausa mixed in, or a combination.
@@ -37,6 +44,7 @@ Return ONLY this JSON (no markdown, no explanation):
   "off_topic_response": "<if is_off_topic, answer warmly or redirect, else empty string>",
   "emotional_response": "<if is_emotional, respond with empathy and encouragement, else empty string>"
 }"""
+
 
 
 def extract_financial_data(text_input=None, image_path=None):
